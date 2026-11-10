@@ -119,8 +119,19 @@ footer{color:var(--muted);font-size:13.5px;margin-top:40px;border-top:1px solid 
 .switch .menu small{display:block;color:var(--muted);font-size:12.5px}
 .switch .menu a.manage{border-top:1px solid var(--line);border-radius:0 0 10px 10px;margin-top:4px;color:var(--brand);font-weight:600;font-size:14.5px}
 .kid{display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 16px;margin:10px 0;flex-wrap:wrap}
-.kinfo{flex:1;min-width:140px}.kinfo b{display:block}.kinfo span{color:var(--muted);font-size:14.5px}
+.kinfo{flex:1;min-width:140px}.kinfo b{display:block}.kinfo>span{display:block;color:var(--muted);font-size:14.5px}
 input[type=date]{width:100%;padding:10px 12px;border:1px solid #cfcce0;border-radius:10px;font:inherit;background:#fff;color:var(--ink)}
+.chips .gap{width:10px}
+.side.plain{background:var(--card);border:1px solid var(--line)}
+.side .next{display:flex;gap:12px;align-items:flex-start;margin:10px 0 12px}
+.side .next b{display:block;font-size:16px;line-height:1.3}.side .next div span{display:block;font-size:14.5px;color:#3d3a66}
+.side .next .ico{width:36px;height:36px}.side .next .ico svg{width:19px;height:19px}
+.side .next .nnote{color:var(--muted);margin-top:2px}
+.side .more{margin:-4px 0 12px;font-size:14px;color:var(--muted)}
+.card.ok{border-color:#9fd3b8;background:#f1faf5}
+.kid.nextup{border-color:var(--brand);box-shadow:inset 4px 0 0 var(--brand)}
+.kinfo .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;word-break:break-all}
+.kid .ico{width:36px;height:36px}.kid .ico svg{width:19px;height:19px}
 @media print{header.top,.noprint{display:none!important}body{background:#fff}.card{break-inside:avoid}}
 `;
 
@@ -131,6 +142,7 @@ function page({ title, nav = '', body, head = '', wide = false }) {
 <meta name="robots" content="noindex">
 <title>${esc(title)}</title>
 <style>${CSS}</style>${head}
+<script>try{document.cookie='tz='+(-new Date().getTimezoneOffset())+';path=/;max-age=31536000;samesite=lax'}catch(e){}</script>
 </head><body>
 <header class="top"><div class="wrap${wide ? ' wide' : ''}"><a class="logo" href="/">Kid<span>Log</span></a>${nav}</div></header>
 <main class="wrap${wide ? ' wide' : ''}">${body}
@@ -213,15 +225,42 @@ const qs = (child, flagged, range) => {
   return s ? `?${s}` : '';
 };
 
-function flagChip(current, base, flagged, range) {
-  return `<div class="chips noprint"><a href="${base + qs(current, !flagged, range)}"${flagged ? ' class="on"' : ''}>${flagged ? 'Showing flagged only' : 'Flagged only'}</a></div>`;
+// Filter buttons above the list: one per child, then the flagged toggle. A locked share link hides what it pins.
+function filterChips({ children, child, base, flagged, range, lock = {} }) {
+  const chip = (label, href, on) => `<a href="${href}"${on ? ' class="on" aria-current="true"' : ''}>${esc(label)}</a>`;
+  const kids = !lock.child && children.length > 1
+    ? chip('All children', base + qs('', flagged, range), !child) +
+      children.map((c) => chip(c.child, base + qs(c.child, flagged, range), !!child && c.child.toLowerCase() === child.toLowerCase())).join('')
+    : '';
+  const flag = lock.flaggedOnly ? '' : `<span class="gap"></span>${chip(flagged ? 'Showing flagged only' : 'Flagged only', base + qs(child, !flagged, range), flagged)}`;
+  return kids || flag ? `<div class="chips noprint">${kids}${flag}</div>` : '';
+}
+
+const KIND = { doctor: ['doctor_visit', 'Doctor appointment'], vaccine: ['vaccine', 'Vaccine appointment'] };
+
+// Right-panel card: the next appointment coming up, with a way to add more and see the rest.
+function upcomingCard({ base, upcoming, shown }) {
+  const q = shown ? `?child=${encodeURIComponent(shown.child)}` : '';
+  const next = upcoming[0];
+  const body = next
+    ? `<div class="next">${icon(KIND[next.kind][0])}<div>
+         <b>${esc(next.title)}</b>
+         <span>${shortDay(next.scheduled_at)} · ${timeLabel(next.scheduled_at)}</span>
+         <span>${esc(KIND[next.kind][1])}${shown ? '' : ` · ${esc(next.child)}`}</span>
+         ${next.notes ? `<span class="nnote">${esc(next.notes)}</span>` : ''}
+       </div></div>
+       ${upcoming.length > 1 ? `<p class="more">+ ${upcoming.length - 1} more coming up</p>` : ''}`
+    : `<p>No upcoming appointments${shown ? ` for ${esc(shown.child)}` : ''}.</p>`;
+  return `<div class="side violet noprint"><h3>Upcoming</h3>${body}
+    <div class="row"><a class="btn small" href="${base}/appointments/new${q}">Add appointment</a>${next ? `<a class="btn ghost small" href="${base}/appointments${q}">${upcoming.length > 1 ? 'See all' : 'View details'}</a>` : `<a class="btn ghost small" href="${base}/appointments${q}">Past appointments</a>`}</div>
+  </div>`;
 }
 
 const pickShown = (children, child) =>
   child ? children.find((c) => c.child.toLowerCase() === child.toLowerCase()) : children.length === 1 ? children[0] : null;
 
 // Shared by the family timeline and the read-only doctor view.
-function board({ space, base, all, entries, children, child, flagged, range, readOnly, shareHref, connectHref }) {
+function board({ space, base, all, entries, children, child, flagged, range, readOnly, shareHref, connectHref, lock = {}, upcoming = [] }) {
   const shown = pickShown(children, child);
   const age = shown ? ageLabel(shown.dob) : '';
   const total = shown ? shown.entries : all.length;
@@ -262,7 +301,7 @@ function board({ space, base, all, entries, children, child, flagged, range, rea
           </form>
           ${readOnly ? '<button class="btn ghost noprint" onclick="window.print()">Print</button>' : `<a class="btn noprint" href="${base}/new${shown ? `?child=${encodeURIComponent(shown.child)}` : ''}">Add an entry</a>`}
         </div>
-        ${flagChip(child, base, flagged, range)}
+        ${filterChips({ children, child, base, flagged, range, lock })}
         ${list}
       </div>
       <aside>
@@ -273,7 +312,8 @@ function board({ space, base, all, entries, children, child, flagged, range, rea
           ${row('feeding', 'Feeding notes', count('feeding'))}
           ${row('sleep', 'Sleep notes', count('sleep'))}
         </ul></div>
-        ${readOnly ? '' : `<div class="side violet noprint"><h3>Doctor visit</h3><p>Send a read-only copy of this timeline. Flagged entries are highlighted.</p><a class="btn ghost small" href="${shareHref}">Share with doctor</a></div>
+        ${readOnly ? '' : `${upcomingCard({ base, upcoming, shown })}
+        <div class="side plain noprint"><h3>Share with doctor</h3><p>Send a read-only link${shown ? ` for ${esc(shown.child)}` : ''}: everything, or only flagged entries.</p><a class="btn ghost small" href="${shareHref}${shown ? `?child=${encodeURIComponent(shown.child)}` : ''}">Create a link</a></div>
         <div class="side amber noprint"><h3>Tell Claude</h3><p>"Aarav had 5 ml paracetamol at 8 this morning. Temperature was 100.2 F before."</p><a class="btn ghost small" href="${connectHref}">Connect Claude</a></div>`}
       </aside>
     </div>`;
@@ -301,14 +341,14 @@ export function landing({ error } = {}) {
   });
 }
 
-export function timeline({ space, all, entries, children, child, flagged, range, stamp, welcome }) {
+export function timeline({ space, all, entries, children, child, flagged, range, upcoming, stamp, welcome }) {
   const base = `/f/${esc(space.key)}`;
   return page({
     title: `${space.name} · KidLog`,
     nav: spaceNav(space, 'timeline', switcher({ children, shown: pickShown(children, child), hrefFor: (c) => base + qs(c, flagged, range), manageHref: `${base}/kids` })),
     wide: true,
     body: `${welcome ? `<p class="note" style="margin-top:20px">Your timeline is ready. Bookmark this page: this private link is how you get back in. Next, <a href="${base}/connect">connect Claude</a>.</p>` : ''}
-      ${board({ space, base, all, entries, children, child, flagged, range, readOnly: false, shareHref: `${base}/share`, connectHref: `${base}/connect` })}
+      ${board({ space, base, all, entries, children, child, flagged, range, upcoming, readOnly: false, shareHref: `${base}/share`, connectHref: `${base}/connect` })}
       <script>
       (function(){var s=${JSON.stringify(stamp)};setInterval(function(){
         if(document.hidden)return;
@@ -380,24 +420,107 @@ export function connect({ space, mcpUrl }) {
   });
 }
 
-export function share({ space, shareUrl }) {
+const scopeLabel = (sh) => `${sh.child ? esc(sh.child) : 'All children'} · ${sh.flagged_only ? 'flagged entries only' : 'entire list'}`;
+
+export function share({ space, base, children, shares, preselect = '', fresh, error }) {
+  const b = `/f/${esc(space.key)}`;
+  const newest = fresh ? shares.find((x) => String(x.id) === String(fresh)) : null;
+  const url = (sh) => `${base}/d/${sh.token}`;
+  const kidOpts = children.map((c) => `<option value="${esc(c.child)}"${c.child.toLowerCase() === preselect.toLowerCase() ? ' selected' : ''}>${esc(c.child)}</option>`).join('');
   return page({
     title: 'Share with doctor · KidLog',
     nav: spaceNav(space, 'share'),
     body: `<h1>Share with your doctor</h1>
-      <p class="lead">A read-only view of the timeline. The doctor can read and print it, and cannot change anything.</p>
-      ${copyBox('share', shareUrl)}
-      <p class="row" style="margin-top:14px"><a class="btn ghost" href="${esc(shareUrl)}" target="_blank" rel="noopener">Preview what the doctor sees</a></p>
-      <p class="note">Entries you flagged "Raise with doctor" are highlighted so they stand out in a short appointment.</p>`,
+      <p class="lead">Create a read-only link. The doctor can read and print it, cannot change anything, and sees only what you choose here.</p>
+      ${error ? `<div class="err">${esc(error)}</div>` : ''}
+      ${newest ? `<div class="card ok"><b>Your link is ready: ${scopeLabel(newest)}</b>
+        <div style="margin-top:10px">${copyBox('fresh', url(newest))}</div>
+        <p class="row" style="margin:12px 0 0"><a class="btn ghost small" href="${esc(url(newest))}" target="_blank" rel="noopener">Preview what the doctor sees</a></p></div>` : ''}
+      <form method="post" action="${b}/share" class="card">
+        <div class="two">
+          <div><label for="child" style="margin-top:0">Whose timeline</label>
+            <select id="child" name="child"><option value="">All children</option>${kidOpts}</select></div>
+          <div><label for="what" style="margin-top:0">What to include</label>
+            <select id="what" name="what"><option value="all">Entire list</option><option value="flagged">Only entries flagged for the doctor</option></select></div>
+        </div>
+        <div class="row" style="margin-top:16px"><button class="btn">Create link</button></div>
+      </form>
+      <h2>Links you have created</h2>
+      ${shares.length ? shares.map((sh) => `<div class="kid">
+          <div class="kinfo"><b>${scopeLabel(sh)}</b><span class="mono">${esc(url(sh))}</span></div>
+          <a class="btn ghost small" href="${esc(url(sh))}" target="_blank" rel="noopener">Open</a>
+          <button type="button" class="btn ghost small" onclick="navigator.clipboard.writeText(${esc(JSON.stringify(url(sh)))}).then(()=>{this.textContent='Copied'})">Copy</button>
+          <form method="post" action="${b}/share/${sh.id}/delete" style="margin:0" onsubmit="return window.confirm('Turn off this link? Anyone who has it will no longer be able to open it.')"><button class="btn danger small">Turn off</button></form>
+        </div>`).join('') : '<div class="card empty">No links yet. Create one above.</div>'}
+      <p class="note" style="margin-top:18px">A link for one child never shows another child's entries. Turn a link off at any time and it stops working straight away.</p>`,
   });
 }
 
-export function doctorView({ space, token, all, entries, children, child, flagged, range }) {
+export function doctorView({ space, token, lock = {}, all, entries, children, child, flagged, range }) {
+  const scope = `${lock.child ? esc(lock.child) : 'All children'}${lock.flaggedOnly ? ' · flagged entries only' : ''}`;
   return page({
-    title: `${space.name} · health timeline`,
-    nav: '<nav><a class="on">Read-only view for the doctor</a></nav>' + switcher({ children, shown: pickShown(children, child), hrefFor: (c) => `/d/${esc(token)}` + qs(c, flagged, range) }),
+    title: `${lock.child || space.name} · health timeline`,
+    nav: `<nav><a class="on">Read-only view for the doctor · ${scope}</a></nav>` +
+      (lock.child ? '' : switcher({ children, shown: pickShown(children, child), hrefFor: (c) => `/d/${esc(token)}` + qs(c, lock.flaggedOnly ? false : flagged, range) })),
     wide: true,
-    body: board({ space, base: `/d/${esc(token)}`, all, entries, children, child, flagged, range, readOnly: true }),
+    body: board({ space, base: `/d/${esc(token)}`, all, entries, children, child: lock.child || child, flagged: lock.flaggedOnly ? false : flagged, range, readOnly: true, lock }),
+  });
+}
+
+export function appointments({ space, list, children, child, now }) {
+  const base = `/f/${esc(space.key)}`;
+  const q = child ? `?child=${encodeURIComponent(child)}` : '';
+  const up = list.filter((a) => a.scheduled_at >= now);
+  const past = list.filter((a) => a.scheduled_at < now).reverse();
+  const row = (a, isNext) => `<div class="kid${isNext ? ' nextup' : ''}">
+      ${icon(KIND[a.kind][0])}
+      <div class="kinfo"><b>${esc(a.title)}${isNext ? ' <span class="tag plain">Next</span>' : ''}</b>
+        <span>${shortDay(a.scheduled_at)} · ${timeLabel(a.scheduled_at)} · ${esc(a.child)} · ${esc(KIND[a.kind][1])}</span>
+        ${a.notes ? `<span>${esc(a.notes)}</span>` : ''}</div>
+      <a class="btn ghost small" href="${base}/appointments/${a.id}">Edit</a>
+    </div>`;
+  const chip = (label, href, on) => `<a href="${href}"${on ? ' class="on"' : ''}>${esc(label)}</a>`;
+  return page({
+    title: 'Appointments · KidLog',
+    nav: spaceNav(space, 'timeline'),
+    body: `<div class="row" style="justify-content:space-between;align-items:flex-end">
+        <div><h1>Appointments</h1><p class="lead" style="margin:0">Doctor and vaccine appointments, soonest first.</p></div>
+        <a class="btn" href="${base}/appointments/new${q}">Add appointment</a>
+      </div>
+      ${children.length > 1 ? `<div class="chips">${chip('All children', `${base}/appointments`, !child)}${children.map((c) => chip(c.child, `${base}/appointments?child=${encodeURIComponent(c.child)}`, !!child && c.child.toLowerCase() === child.toLowerCase())).join('')}</div>` : ''}
+      <h2>Upcoming</h2>
+      ${up.length ? up.map((a, i) => row(a, i === 0)).join('') : '<div class="card empty">Nothing coming up. Add one, or tell Claude: "Jay has a follow-up on 28 January at 5 PM."</div>'}
+      ${past.length ? `<h2>Past</h2>${past.map((a) => row(a, false)).join('')}` : ''}
+      <p style="margin-top:20px"><a class="btn ghost" href="${base}${q}">Back to the timeline</a></p>`,
+  });
+}
+
+export function appointmentForm({ space, appt, error, isNew, children }) {
+  const base = `/f/${esc(space.key)}`;
+  const a = appt;
+  return page({
+    title: `${isNew ? 'Add' : 'Edit'} appointment · KidLog`,
+    nav: spaceNav(space, 'timeline'),
+    body: `<h1>${isNew ? 'Add an appointment' : 'Edit appointment'}</h1>
+      <p class="lead">${isNew ? 'A doctor visit or vaccine that is coming up. You can add as many as you need.' : 'Change the date, time or details.'}</p>
+      ${error ? `<div class="err">${esc(error)}</div>` : ''}
+      <form method="post" action="${isNew ? `${base}/appointments` : `${base}/appointments/${a.id}`}">
+        <div class="two">
+          <div><label for="child">Child</label>${children.length
+            ? `<select id="child" name="child" required>${!children.some((c) => c.child === a.child) ? `<option value="${esc(a.child)}" selected>${esc(a.child) || 'Choose a child'}</option>` : ''}${children.map((c) => `<option value="${esc(c.child)}"${c.child === a.child ? ' selected' : ''}>${esc(c.child)}</option>`).join('')}</select>`
+            : `<input id="child" type="text" name="child" value="${esc(a.child)}" required maxlength="60" placeholder="First name">`}</div>
+          <div><label for="kind">Type</label><select id="kind" name="kind">
+            <option value="doctor"${a.kind === 'doctor' ? ' selected' : ''}>Doctor appointment</option>
+            <option value="vaccine"${a.kind === 'vaccine' ? ' selected' : ''}>Vaccine appointment</option></select></div>
+        </div>
+        <div class="two">
+          <div><label for="when">Date and time</label><input id="when" type="datetime-local" name="scheduled_at" value="${esc(a.scheduled_at)}" required></div>
+          <div><label for="title">What it is for</label><input id="title" type="text" name="title" value="${esc(a.title)}" maxlength="120" placeholder="e.g. Paediatrician follow-up, MMR second dose"></div>
+        </div>
+        <label for="notes">Notes (optional)</label><textarea id="notes" name="notes" maxlength="1000" style="min-height:90px" placeholder="Clinic, what to bring, questions to ask">${esc(a.notes)}</textarea>
+        <div class="row" style="margin-top:22px"><button class="btn">${isNew ? 'Add appointment' : 'Save changes'}</button><a class="btn ghost" href="${base}/appointments">Cancel</a></div>
+      </form>
+      ${isNew ? '' : `<form method="post" action="${base}/appointments/${a.id}/delete" style="margin-top:28px" onsubmit="return window.confirm('Delete this appointment?')"><button class="btn danger small">Delete this appointment</button></form>`}`,
   });
 }
 
