@@ -12,6 +12,7 @@ Rules for writing entries:
 - Do not diagnose or rate urgency. If something sounds worrying, tell the parent in the chat to contact their doctor; do not write that judgement into the entry.
 - If one message covers several distinct events (a fever, a medicine dose, a missed feed), save one entry per event.
 - A child is added automatically the first time you log an event for them. Use save_child_profile when the parent tells you a birth date.
+- When the parent mentions a future doctor or vaccine appointment, save it with add_appointment (not log_event, which is for things that already happened).
 - Use the parent's local date and time. If they give no date, use today's date; if they give no time, use the current time.
 - After saving, tell the parent briefly what was saved and give them the timeline link.`;
 
@@ -135,6 +136,43 @@ function buildServer(space, baseUrl) {
     const r = await db.saveChild(space.id, { name: a.child_name, dob: dob.value === null ? undefined : dob.value });
     if (r.error) return fail(r.error);
     return ok({ saved: (await kids()).find((c) => c.child === r.value), children_url: `${timelineUrl}/kids` });
+  });
+
+  const apptShape = (a) => ({ id: a.id, child: a.child, type: a.kind, scheduled_at: a.scheduled_at, title: a.title, notes: a.notes });
+
+  server.registerTool('add_appointment', {
+    title: 'Add an upcoming appointment',
+    description:
+      'Save a future doctor or vaccine appointment for a child. Use only the date, time and details the parent gave. ' +
+      'For something that already happened, use log_event instead.',
+    inputSchema: {
+      child_name: z.string().describe("The child's first name"),
+      type: z.enum(db.APPOINTMENT_KINDS).describe('doctor or vaccine'),
+      scheduled_at: z.string().describe('Local date and time of the appointment, YYYY-MM-DDTHH:MM (24-hour), e.g. 2027-01-28T17:00'),
+      title: z.string().optional().describe('Short label, e.g. "Paediatrician follow-up" or "MMR second dose"'),
+      notes: z.string().optional().describe('Anything the parent wants to remember for it, e.g. clinic name or what to bring'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, async (a) => {
+    const v = db.validateAppointment({ child: a.child_name, kind: a.type, scheduled_at: a.scheduled_at, title: a.title, notes: a.notes });
+    if (v.error) return fail(v.error);
+    const saved = await db.addAppointment(space.id, v.value, 'claude');
+    return ok({ saved: apptShape(saved), appointments_url: `${timelineUrl}/appointments`, timeline_url: timelineUrl });
+  });
+
+  server.registerTool('list_appointments', {
+    title: 'List appointments',
+    description: 'List saved doctor and vaccine appointments, soonest first. By default only those from today onwards.',
+    inputSchema: {
+      child_name: z.string().optional().describe('Only this child'),
+      include_past: z.boolean().optional().describe('Also include appointments that have already passed'),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => {
+    // One spare day so "today" in any timezone is always included.
+    const from = a.include_past ? undefined : new Date(Date.now() - 86400000).toISOString().slice(0, 16);
+    const rows = await db.listAppointments(space.id, { child: a.child_name, from });
+    return ok({ count: rows.length, appointments: rows.map(apptShape), appointments_url: `${timelineUrl}/appointments` });
   });
 
   return server;
