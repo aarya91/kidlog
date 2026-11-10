@@ -52,6 +52,27 @@ export function init() {
       INSERT INTO children (space_id, name)
         SELECT space_id, min(child) FROM entries GROUP BY space_id, lower(child)
         ON CONFLICT (space_id, lower(name)) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS shares (
+        id SERIAL PRIMARY KEY,
+        space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        token TEXT UNIQUE NOT NULL,
+        child TEXT,
+        flagged_only BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS appointments (
+        id SERIAL PRIMARY KEY,
+        space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        child TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scheduled_at TEXT NOT NULL,
+        title TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'manual',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS appointments_space_idx ON appointments(space_id, scheduled_at);
     `).catch((e) => { ready = undefined; throw e; });
   }
   return ready;
@@ -166,11 +187,17 @@ export async function saveChild(spaceId, { id, name, dob }) {
     if (clash.rows[0]) {
       const target = clash.rows[0];
       await client.query('UPDATE entries SET child = (SELECT name FROM children WHERE id = $1) WHERE space_id = $2 AND lower(child) = lower($3)', [target.id, spaceId, current.child]);
+      for (const t of ['appointments', 'shares']) {
+        await client.query(`UPDATE ${t} SET child = (SELECT name FROM children WHERE id = $1) WHERE space_id = $2 AND lower(child) = lower($3)`, [target.id, spaceId, current.child]);
+      }
       const keepDob = dob || target.dob || current.dob;
       await client.query('UPDATE children SET dob = $1 WHERE id = $2', [keepDob, target.id]);
       await client.query('DELETE FROM children WHERE id = $1', [current.id]);
     } else {
       await client.query('UPDATE entries SET child = $1 WHERE space_id = $2 AND lower(child) = lower($3)', [name, spaceId, current.child]);
+      for (const t of ['appointments', 'shares']) {
+        await client.query(`UPDATE ${t} SET child = $1 WHERE space_id = $2 AND lower(child) = lower($3)`, [name, spaceId, current.child]);
+      }
       await client.query('UPDATE children SET name = $1, dob = $2 WHERE id = $3', [name, dob !== undefined ? dob : current.dob, current.id]);
     }
     await client.query('COMMIT');
@@ -183,14 +210,125 @@ export async function saveChild(spaceId, { id, name, dob }) {
   return { value: name };
 }
 
-// Only children with no entries can be removed.
+// Only children with no entries and no appointments can be removed.
 export async function deleteChild(spaceId, id) {
   const c = await getChild(spaceId, id);
   if (!c) return;
-  await pool.query(
-    'DELETE FROM children WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM entries WHERE space_id = $2 AND lower(child) = lower($3))',
+  const r = await pool.query(
+    `DELETE FROM children WHERE id = $1
+       AND NOT EXISTS (SELECT 1 FROM entries WHERE space_id = $2 AND lower(child) = lower($3))
+       AND NOT EXISTS (SELECT 1 FROM appointments WHERE space_id = $2 AND lower(child) = lower($3))`,
     [c.id, spaceId, c.child]
   );
+  if (r.rowCount) await pool.query('DELETE FROM shares WHERE space_id = $1 AND lower(child) = lower($2)', [spaceId, c.child]);
+}
+
+// ---- Doctor share links ----
+// Each link is locked to one child (or all children) and to flagged entries only (or everything).
+export async function createShare(spaceId, { child, flaggedOnly }) {
+  let name = null;
+  if (child) {
+    const r = await pool.query('SELECT name FROM children WHERE space_id = $1 AND lower(name) = lower($2)', [spaceId, child]);
+    if (!r.rows[0]) return { error: 'Choose a child from the list.' };
+    name = r.rows[0].name;
+  }
+  // Reuse an existing link with the same scope instead of piling up duplicates.
+  const dup = await pool.query(
+    'SELECT * FROM shares WHERE space_id = $1 AND flagged_only = $2 AND coalesce(lower(child), \'\') = coalesce(lower($3), \'\')',
+    [spaceId, !!flaggedOnly, name]
+  );
+  if (dup.rows[0]) return { value: dup.rows[0] };
+  const r = await pool.query(
+    'INSERT INTO shares (space_id, token, child, flagged_only) VALUES ($1, $2, $3, $4) RETURNING *',
+    [spaceId, token(18), name, !!flaggedOnly]
+  );
+  return { value: r.rows[0] };
+}
+
+export async function listShares(spaceId) {
+  const r = await pool.query('SELECT * FROM shares WHERE space_id = $1 ORDER BY id DESC', [spaceId]);
+  return r.rows;
+}
+
+export async function deleteShare(spaceId, id) {
+  const n = Number(id);
+  if (Number.isInteger(n)) await pool.query('DELETE FROM shares WHERE space_id = $1 AND id = $2', [spaceId, n]);
+}
+
+// Returns { space, child, flaggedOnly } for a share token, or undefined.
+// The family's original link (spaces.share_token) still works and shows everything.
+export async function resolveShare(t) {
+  await init();
+  const r = await pool.query(
+    'SELECT s.*, sh.child AS share_child, sh.flagged_only AS share_flagged FROM shares sh JOIN spaces s ON s.id = sh.space_id WHERE sh.token = $1',
+    [String(t)]
+  );
+  if (r.rows[0]) {
+    const { share_child, share_flagged, ...space } = r.rows[0];
+    return { space, child: share_child, flaggedOnly: share_flagged };
+  }
+  const space = await spaceByShareToken(t);
+  return space ? { space, child: null, flaggedOnly: false } : undefined;
+}
+
+// ---- Upcoming appointments ----
+export const APPOINTMENT_KINDS = ['doctor', 'vaccine'];
+
+export function validateAppointment(input) {
+  const out = {};
+  out.child = clean(input.child, 60);
+  if (!out.child) return { error: "The child's name is required." };
+  out.kind = clean(input.kind, 20).toLowerCase();
+  if (!APPOINTMENT_KINDS.includes(out.kind)) return { error: 'Type must be doctor or vaccine.' };
+  out.scheduled_at = normaliseWhen(input.scheduled_at);
+  if (!out.scheduled_at) return { error: 'The date and time must look like 2026-11-28T17:00.' };
+  out.title = clean(input.title, 120) || (out.kind === 'vaccine' ? 'Vaccine appointment' : 'Doctor appointment');
+  out.notes = clean(input.notes, 1000);
+  return { value: out };
+}
+
+export async function addAppointment(spaceId, v, source) {
+  const child = await canonicalChild(spaceId, v.child);
+  const r = await pool.query(
+    `INSERT INTO appointments (space_id, child, kind, scheduled_at, title, notes, source)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [spaceId, child, v.kind, v.scheduled_at, v.title, v.notes || '', source]
+  );
+  return r.rows[0];
+}
+
+export async function getAppointment(spaceId, id) {
+  const n = Number(id);
+  if (!Number.isInteger(n)) return undefined;
+  const r = await pool.query('SELECT * FROM appointments WHERE space_id = $1 AND id = $2', [spaceId, n]);
+  return r.rows[0];
+}
+
+export async function updateAppointment(spaceId, id, v) {
+  const existing = await getAppointment(spaceId, id);
+  if (!existing) return undefined;
+  const child = await canonicalChild(spaceId, v.child);
+  const r = await pool.query(
+    `UPDATE appointments SET child = $1, kind = $2, scheduled_at = $3, title = $4, notes = $5, updated_at = now()
+     WHERE space_id = $6 AND id = $7 RETURNING *`,
+    [child, v.kind, v.scheduled_at, v.title, v.notes || '', spaceId, existing.id]
+  );
+  return r.rows[0];
+}
+
+export async function deleteAppointment(spaceId, id) {
+  const n = Number(id);
+  if (Number.isInteger(n)) await pool.query('DELETE FROM appointments WHERE space_id = $1 AND id = $2', [spaceId, n]);
+}
+
+// Soonest first.
+export async function listAppointments(spaceId, { child, from } = {}) {
+  const where = ['space_id = $1'];
+  const vals = [spaceId];
+  if (child) { vals.push(child); where.push(`lower(child) = lower($${vals.length})`); }
+  if (from) { vals.push(from); where.push(`scheduled_at >= $${vals.length}`); }
+  const r = await pool.query(`SELECT * FROM appointments WHERE ${where.join(' AND ')} ORDER BY scheduled_at, id LIMIT 500`, vals);
+  return r.rows;
 }
 
 export async function addEntry(spaceId, v, source) {
@@ -285,9 +423,10 @@ export function ageLabel(dob, now = new Date()) {
 export async function stamp(spaceId) {
   const r = await pool.query(
     `SELECT count(*)::int AS n, coalesce(max(updated_at)::text, '') AS t,
-            (SELECT count(*)::int FROM children WHERE space_id = $1) AS k
+            (SELECT count(*)::int FROM children WHERE space_id = $1) AS k,
+            (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') FROM appointments WHERE space_id = $1) AS a
      FROM entries WHERE space_id = $1`,
     [spaceId]
   );
-  return `${r.rows[0].n}:${r.rows[0].k}:${r.rows[0].t}`;
+  return `${r.rows[0].n}:${r.rows[0].k}:${r.rows[0].t}:${r.rows[0].a}`;
 }
