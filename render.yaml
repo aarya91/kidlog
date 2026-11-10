@@ -1,0 +1,17 @@
+# Alternative host: Render. "New > Blueprint" and pick this repo.
+services:
+  - type: web
+    name: kidlog
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kidlog-db
+          property: connectionString
+databases:
+  - name: kidlog-db
+    plan: free
