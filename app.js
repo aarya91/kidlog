@@ -19,13 +19,23 @@ app.use((req, res, next) => {
 const baseUrl = (req) => process.env.PUBLIC_URL?.replace(/\/$/, '') || `${req.protocol}://${req.get('host')}`;
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+// "Now" in the visitor's own timezone as YYYY-MM-DDTHH:MM. The browser stores its UTC offset in a small cookie.
+function localNow(req) {
+  const m = /(?:^|;\s*)tz=(-?\d{1,4})(?:;|$)/.exec(req.headers.cookie || '');
+  const offset = m ? Math.max(-840, Math.min(840, Number(m[1]))) : 0;
+  return new Date(Date.now() + offset * 60000).toISOString().slice(0, 16);
+}
+
 const RANGE_DAYS = { 7: 7, 30: 30, 90: 90 };
 // Loads everything for the board, then narrows by period and flag in memory.
-async function boardData(spaceId, query) {
-  const child = db.clean(query.child, 60);
-  const flagged = query.flagged === '1';
+// lock = { child, flaggedOnly } pins a doctor share link to its scope, whatever the query says.
+async function boardData(spaceId, query, lock = {}) {
+  const child = lock.child || db.clean(query.child, 60);
+  const flagged = lock.flaggedOnly || query.flagged === '1';
   const range = RANGE_DAYS[query.range] ? String(query.range) : 'all';
-  const [all, children] = await Promise.all([db.listEntries(spaceId, { child }), db.listChildren(spaceId)]);
+  let [all, children] = await Promise.all([db.listEntries(spaceId, { child }), db.listChildren(spaceId)]);
+  if (lock.child) children = children.filter((c) => c.child.toLowerCase() === lock.child.toLowerCase());
+  if (lock.flaggedOnly) all = all.filter((e) => e.flagged);
   let entries = all;
   if (range !== 'all') {
     // One spare day so "today" in any timezone is always included.
@@ -58,7 +68,8 @@ const withSpace = wrap(async (req, res, next) => {
 
 app.get('/f/:key', withSpace, wrap(async (req, res) => {
   const [data, stamp] = await Promise.all([boardData(req.space.id, req.query), db.stamp(req.space.id)]);
-  res.send(views.timeline({ space: req.space, ...data, stamp, welcome: req.query.welcome === '1' }));
+  const upcoming = await db.listAppointments(req.space.id, { child: data.child, from: localNow(req) });
+  res.send(views.timeline({ space: req.space, ...data, upcoming, stamp, welcome: req.query.welcome === '1' }));
 }));
 
 app.get('/f/:key/stamp', withSpace, wrap(async (req, res) => res.type('text').send(await db.stamp(req.space.id))));
@@ -66,8 +77,80 @@ app.get('/f/:key/stamp', withSpace, wrap(async (req, res) => res.type('text').se
 app.get('/f/:key/connect', withSpace, (req, res) =>
   res.send(views.connect({ space: req.space, mcpUrl: `${baseUrl(req)}/mcp/${req.space.key}` })));
 
-app.get('/f/:key/share', withSpace, (req, res) =>
-  res.send(views.share({ space: req.space, shareUrl: `${baseUrl(req)}/d/${req.space.share_token}` })));
+// ---- Share with doctor ----
+const sharePage = async (req, extra = {}) => views.share({
+  space: req.space, base: baseUrl(req),
+  children: await db.listChildren(req.space.id), shares: await db.listShares(req.space.id),
+  preselect: db.clean(req.query.child, 60), ...extra,
+});
+
+app.get('/f/:key/share', withSpace, wrap(async (req, res) => res.send(await sharePage(req, { fresh: req.query.new }))));
+
+app.post('/f/:key/share', withSpace, wrap(async (req, res) => {
+  const r = await db.createShare(req.space.id, { child: db.clean(req.body.child, 60), flaggedOnly: req.body.what === 'flagged' });
+  if (r.error) return res.status(400).send(await sharePage(req, { error: r.error }));
+  res.redirect(303, `/f/${req.space.key}/share?new=${r.value.id}`);
+}));
+
+app.post('/f/:key/share/:id/delete', withSpace, wrap(async (req, res) => {
+  await db.deleteShare(req.space.id, req.params.id);
+  res.redirect(303, `/f/${req.space.key}/share`);
+}));
+
+// ---- Appointments ----
+const apptBody = (b) => ({ child: b.child, kind: b.kind, scheduled_at: b.scheduled_at, title: b.title, notes: b.notes ?? '' });
+
+app.get('/f/:key/appointments', withSpace, wrap(async (req, res) => {
+  const child = db.clean(req.query.child, 60);
+  const [list, children] = await Promise.all([db.listAppointments(req.space.id, { child }), db.listChildren(req.space.id)]);
+  res.send(views.appointments({ space: req.space, list, children, child, now: localNow(req) }));
+}));
+
+app.get('/f/:key/appointments/new', withSpace, wrap(async (req, res) => {
+  const children = await db.listChildren(req.space.id);
+  const picked = children.find((c) => c.child.toLowerCase() === db.clean(req.query.child, 60).toLowerCase());
+  const appt = { child: picked ? picked.child : children.length === 1 ? children[0].child : '', kind: 'doctor', scheduled_at: '', title: '', notes: '' };
+  res.send(views.appointmentForm({ space: req.space, appt, isNew: true, children }));
+}));
+
+app.post('/f/:key/appointments', withSpace, wrap(async (req, res) => {
+  const body = apptBody(req.body);
+  const v = db.validateAppointment(body);
+  if (v.error) {
+    return res.status(400).send(views.appointmentForm({
+      space: req.space, appt: { ...body, scheduled_at: db.normaliseWhen(body.scheduled_at) || '' }, error: v.error, isNew: true,
+      children: await db.listChildren(req.space.id),
+    }));
+  }
+  const a = await db.addAppointment(req.space.id, v.value, 'manual');
+  res.redirect(303, `/f/${req.space.key}?child=${encodeURIComponent(a.child)}`);
+}));
+
+app.get('/f/:key/appointments/:id', withSpace, wrap(async (req, res) => {
+  const appt = await db.getAppointment(req.space.id, req.params.id);
+  if (!appt) return res.status(404).send(views.notFound('That appointment no longer exists.'));
+  res.send(views.appointmentForm({ space: req.space, appt, isNew: false, children: await db.listChildren(req.space.id) }));
+}));
+
+app.post('/f/:key/appointments/:id', withSpace, wrap(async (req, res) => {
+  const existing = await db.getAppointment(req.space.id, req.params.id);
+  if (!existing) return res.status(404).send(views.notFound('That appointment no longer exists.'));
+  const body = apptBody(req.body);
+  const v = db.validateAppointment(body);
+  if (v.error) {
+    return res.status(400).send(views.appointmentForm({
+      space: req.space, appt: { ...existing, ...body, scheduled_at: db.normaliseWhen(body.scheduled_at) || existing.scheduled_at },
+      error: v.error, isNew: false, children: await db.listChildren(req.space.id),
+    }));
+  }
+  await db.updateAppointment(req.space.id, existing.id, v.value);
+  res.redirect(303, `/f/${req.space.key}/appointments`);
+}));
+
+app.post('/f/:key/appointments/:id/delete', withSpace, wrap(async (req, res) => {
+  await db.deleteAppointment(req.space.id, req.params.id);
+  res.redirect(303, `/f/${req.space.key}/appointments`);
+}));
 
 // ---- Child profiles ----
 app.get('/f/:key/kids', withSpace, wrap(async (req, res) =>
@@ -152,9 +235,10 @@ app.post('/f/:key/e/:id/delete', withSpace, wrap(async (req, res) => {
 
 // ---- Read-only doctor view ----
 app.get('/d/:token', wrap(async (req, res) => {
-  const space = await db.spaceByShareToken(req.params.token);
-  if (!space) return res.status(404).send(views.notFound('This share link is not valid.'));
-  res.send(views.doctorView({ space, token: req.params.token, ...(await boardData(space.id, req.query)) }));
+  const share = await db.resolveShare(req.params.token);
+  if (!share) return res.status(404).send(views.notFound('This share link is not valid or has been turned off.'));
+  const lock = { child: share.child, flaggedOnly: share.flaggedOnly };
+  res.send(views.doctorView({ space: share.space, token: req.params.token, lock, ...(await boardData(share.space.id, req.query, lock)) }));
 }));
 
 app.use((req, res) => res.status(404).send(views.notFound()));
